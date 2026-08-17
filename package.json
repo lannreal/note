@@ -15,8 +15,6 @@
     "express": "^5.2.1",
     "got-scraping": "^4.2.1",
     "multer": "^2.2.0",
-    "playwright": "^1.62.0",
-    "puppeteer-core": "^25.3.0",
     "readline-sync": "^1.4.10"
   }
 }

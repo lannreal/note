@@ -1,7 +1,6 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
-const { chromium } = require('playwright');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
@@ -11,30 +10,51 @@ const crypto = require('crypto');
 const app = express();
 app.use(cors());
 app.use(express.json());
-const upload = multer({ dest: 'uploads/' }); // for API file uploads
+
+// Ensure uploads folder exists
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
+const upload = multer({ dest: 'uploads/' });
 
 const PORT = process.env.PORT || 3000;
 
-// --- STATE ---
-let TOKENS = ["duTfC7qSawIun1Imh9WVfnIDR2weCibjUIumAegcHQE"]; // Initial valid token
+// --- STATE & TOKEN POOL ---
+let TOKENS = []; // Token pool
 let currentTokenIndex = 0;
+let accountCreationPromise = null; // Mutex lock for concurrent account creations
 
 const availableModels = [
     "gpt-4o-mini",
     "gpt-4o",
+    "gpt-4.1-mini",
     "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
     "gemini-3-flash-preview",
     "deepseek-chat",
     "deepseek-reasoner"
 ];
-const visionModels = ["gpt-4o-mini", "gpt-4o", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3-flash-preview"];
-const reasoningModels = ["deepseek-chat", "deepseek-reasoner"];
+
+const visionModels = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview"
+];
+
+const reasoningModels = [
+    "deepseek-chat",
+    "deepseek-reasoner"
+];
+
 let selectedModel = "gpt-4o";
 let showReasoning = true;
 let cliConversationId = `conv-${Date.now()}`;
 
-// --- UTILS ---
+// --- CLI FORMATTING & UTILS ---
 const c = {
     bold: '\x1b[1m', dim: '\x1b[90m', blue: '\x1b[34m', cyan: '\x1b[36m',
     magenta: '\x1b[35m', green: '\x1b[32m', yellow: '\x1b[33m', red: '\x1b[31m',
@@ -64,91 +84,207 @@ class Spinner {
     }
 }
 
-// --- AUTO ACCOUNT ---
-async function createNewNoteGPTAccount() {
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    
+// --- MULTI-PROVIDER TEMP MAIL ENGINE ---
+const MAIL_PROVIDERS = [
+    'https://api.mail.tm',
+    'https://api.mail.gw'
+];
+
+async function fetchWithTimeout(resource, options = {}, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const timestamp = Date.now();
-        const username = `botgpt_${timestamp}`;
-        const domain = 'binancepools.cloud';
-        const email = `${username}@${domain}`;
-        const password = 'BotPass123!@#';
-        
-        await page.goto(`https://generator.email/${domain}/${username}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(2000);
-        
-        const regResult = await page.evaluate(async (data) => {
-            try {
-                const res = await fetch('https://notegpt.io/api/v1/auth/email/register', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email: data.email, password: data.password })
-                });
-                return await res.json();
-            } catch (e) { return { error: e.toString() }; }
-        }, { email, password });
-        
-        if (regResult.code !== 0) throw new Error("Gagal registrasi");
-        
-        let foundLink = null;
-        for (let i = 0; i < 30; i++) {
-            await page.waitForTimeout(1000);
-            const emails = await page.$$('#email-table .g8r');
-            if (emails.length > 0) {
-                await emails[0].click();
-                await page.waitForTimeout(2000);
-                let mailContent = '';
-                try {
-                    const msgFrame = await page.$('#email-table iframe');
-                    if (msgFrame) {
-                        const frameObj = await msgFrame.contentFrame();
-                        mailContent = await frameObj.content();
-                    } else {
-                        mailContent = await page.content();
-                    }
-                } catch(e) {}
-                const linkMatch = mailContent.match(/href="(https:\/\/notegpt\.io\/user\/verify-email\?token=[^"]+)"/);
-                if (linkMatch) {
-                    foundLink = linkMatch[1];
-                    break;
-                }
-            }
-        }
-        
-        if (!foundLink) throw new Error("Timeout: Email tidak masuk");
-        
-        const page2 = await context.newPage();
-        await page2.goto(foundLink, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page2.waitForTimeout(3000);
-        
-        const loginResult = await page2.evaluate(async (data) => {
-            const res = await fetch('https://notegpt.io/api/v1/auth/email/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email: data.email, password: data.password })
-            });
-            return await res.json();
-        }, { email, password });
-        
-        if (loginResult.code !== 0) throw new Error("Gagal login");
-        
-        const cookies = await context.cookies();
-        const ncCookie = cookies.find(c => c.name === 'nc_token');
-        if (!ncCookie) throw new Error("nc_token tidak ditemukan");
-        
-        return ncCookie.value;
-    } catch (error) {
-        return null;
-    } finally {
-        await browser.close();
+        const response = await fetch(resource, {
+            ...options,
+            signal: controller.signal
+        });
+        clearTimeout(id);
+        return response;
+    } catch (err) {
+        clearTimeout(id);
+        throw err;
     }
 }
 
-// --- IMAGE UPLOAD ---
+async function createTempMailbox() {
+    let lastError = null;
+
+    for (const baseUrl of MAIL_PROVIDERS) {
+        try {
+            // 1. Get available domains
+            const domainRes = await fetchWithTimeout(`${baseUrl}/domains`, {}, 10000);
+            if (!domainRes.ok) continue;
+            const domainData = await domainRes.json();
+            const members = domainData['hydra:member'] || [];
+            if (members.length === 0) continue;
+
+            const domain = members[0].domain;
+            const randomId = Math.random().toString(36).substring(2, 11);
+            const address = `bot_${randomId}@${domain}`;
+            const password = "NotePassword123!";
+
+            // 2. Create account
+            const accRes = await fetchWithTimeout(`${baseUrl}/accounts`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ address, password })
+            }, 10000);
+            if (!accRes.ok) continue;
+
+            // 3. Get Auth Token
+            const tokenRes = await fetchWithTimeout(`${baseUrl}/token`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ address, password })
+            }, 10000);
+            if (!tokenRes.ok) continue;
+            const tokenData = await tokenRes.json();
+
+            if (tokenData.token) {
+                return {
+                    baseUrl,
+                    email: address,
+                    password,
+                    mailToken: tokenData.token
+                };
+            }
+        } catch (err) {
+            lastError = err;
+        }
+    }
+    throw new Error(`Semua provider temporary mail gagal: ${lastError ? lastError.message : 'Unknown error'}`);
+}
+
+async function pollVerificationToken(mailbox, maxRetries = 25, delayMs = 1500) {
+    const { baseUrl, mailToken } = mailbox;
+
+    for (let i = 0; i < maxRetries; i++) {
+        await new Promise(r => setTimeout(r, delayMs));
+        try {
+            const listRes = await fetchWithTimeout(`${baseUrl}/messages`, {
+                headers: { 'Authorization': `Bearer ${mailToken}` }
+            }, 8000);
+            if (!listRes.ok) continue;
+
+            const listData = await listRes.json();
+            const messages = listData['hydra:member'] || [];
+            if (messages.length > 0) {
+                const msgRes = await fetchWithTimeout(`${baseUrl}/messages/${messages[0].id}`, {
+                    headers: { 'Authorization': `Bearer ${mailToken}` }
+                }, 8000);
+                if (!msgRes.ok) continue;
+
+                const msgData = await msgRes.json();
+                const content = (msgData.text || "") + " " + (Array.isArray(msgData.html) ? msgData.html.join("") : (msgData.html || ""));
+                const match = content.match(/token=([a-zA-Z0-9_\-\.]+)/i);
+                if (match) {
+                    return match[1];
+                }
+            }
+        } catch (e) {}
+    }
+    return null;
+}
+
+// --- REVERSE-ENGINEERED NOTEGPT AUTO-ACCOUNT GENERATOR ---
+async function generateFreshNoteGPTToken() {
+    // If an account creation is already running, reuse the active promise (Mutex)
+    if (accountCreationPromise) {
+        return await accountCreationPromise;
+    }
+
+    accountCreationPromise = (async () => {
+        try {
+            // Step 1: Create Temp Mailbox
+            const mailbox = await createTempMailbox();
+
+            // Step 2: Register to NoteGPT
+            const regRes = await fetchWithTimeout('https://notegpt.io/api/v1/auth/email/register', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+                    'Origin': 'https://notegpt.io',
+                    'Referer': 'https://notegpt.io/auth/register'
+                },
+                body: JSON.stringify({ email: mailbox.email, password: mailbox.password })
+            }, 15000);
+
+            const regJson = await regRes.json();
+            if (regJson.code !== 100000 && regJson.code !== 0) {
+                throw new Error(`Registrasi NoteGPT ditolak: ${regJson.message || 'Unknown error'}`);
+            }
+
+            // Step 3: Wait & Extract Confirmation Token
+            const confirmToken = await pollVerificationToken(mailbox);
+            if (!confirmToken) {
+                throw new Error('Timeout: Email verifikasi dari NoteGPT tidak diterima.');
+            }
+
+            // Step 4: Confirm Verification Link via API
+            const confirmRes = await fetchWithTimeout('https://notegpt.io/api/v1/auth/email/register/confirm', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+                    'Origin': 'https://notegpt.io',
+                    'Referer': `https://notegpt.io/auth/register-confirm?token=${confirmToken}&email=${encodeURIComponent(mailbox.email)}&lang=en`
+                },
+                body: JSON.stringify({ token: confirmToken })
+            }, 15000);
+
+            const confirmJson = await confirmRes.json();
+            if (confirmJson.code !== 100000 && confirmJson.code !== 0) {
+                throw new Error(`Konfirmasi verifikasi gagal: ${confirmJson.message || 'Unknown error'}`);
+            }
+
+            // Step 5: Login to get access token (nc_token)
+            const loginRes = await fetchWithTimeout('https://notegpt.io/api/v1/auth/email/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+                    'Origin': 'https://notegpt.io',
+                    'Referer': 'https://notegpt.io/auth/login'
+                },
+                body: JSON.stringify({ email: mailbox.email, password: mailbox.password })
+            }, 15000);
+
+            const loginJson = await loginRes.json();
+            let ncToken = loginJson?.data?.access_token || loginJson?.data?.token;
+
+            if (!ncToken) {
+                const setCookies = loginRes.headers.getSetCookie ? loginRes.headers.getSetCookie() : [loginRes.headers.get("set-cookie")];
+                for (const sc of setCookies) {
+                    if (!sc) continue;
+                    const m = sc.match(/nc_token=([^;]+)/);
+                    if (m) {
+                        ncToken = m[1];
+                        break;
+                    }
+                }
+            }
+
+            if (!ncToken) throw new Error('nc_token tidak ditemukan dalam response login.');
+
+            // Add new fresh token to pool
+            TOKENS.push(ncToken);
+            currentTokenIndex = TOKENS.length - 1;
+            return ncToken;
+        } finally {
+            accountCreationPromise = null;
+        }
+    })();
+
+    return await accountCreationPromise;
+}
+
+// --- IMAGE UPLOAD SERVICE ---
 async function uploadToUguu(filePath) {
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`File gambar tidak ditemukan di path: ${filePath}`);
+    }
+
     const fileBuffer = fs.readFileSync(filePath);
     const fileName = path.basename(filePath);
     
@@ -160,32 +296,43 @@ async function uploadToUguu(filePath) {
     );
     body = Buffer.concat([body, fileBuffer, Buffer.from(`\r\n--${boundary}--\r\n`)]);
 
-    const response = await fetch('https://uguu.se/upload.php', {
+    const response = await fetchWithTimeout('https://uguu.se/upload.php', {
         method: 'POST',
         headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
         body: body
-    });
+    }, 20000);
 
-    if (!response.ok) throw new Error(`Upload gagal HTTP ${response.status}`);
+    if (!response.ok) throw new Error(`Upload gambar gagal (HTTP ${response.status})`);
     const data = await response.json();
     if (data.success && data.files && data.files.length > 0) {
         return data.files[0].url;
     } else {
-        throw new Error("Gagal mendapatkan URL gambar");
+        throw new Error("Gagal mendapatkan URL gambar publik dari hosting.");
     }
 }
 
-// --- CORE AI ENGINE ---
-async function askNoteGPT(prompt, modelStr, retryCount = 0, imageUrl = null, isAPI = false, convId = null) {
-    const TOKEN = TOKENS[currentTokenIndex];
+// --- CORE AI STREAMING ENGINE ---
+async function askNoteGPT(prompt, modelStr = "gpt-4o", retryCount = 0, imageUrl = null, isAPI = false, convId = null) {
+    // Ensure we have at least one active token
+    if (TOKENS.length === 0) {
+        let spinner;
+        if (!isAPI) {
+            spinner = new Spinner("Menginisialisasi token NoteGPT pertama...");
+            spinner.start();
+        }
+        await generateFreshNoteGPTToken();
+        if (!isAPI && spinner) spinner.stop();
+    }
+
+    const activeToken = TOKENS[currentTokenIndex];
+    const targetConvId = convId || cliConversationId;
     let spinner;
     
     if (!isAPI) {
-        spinner = new Spinner(retryCount > 0 ? "Retrying..." : "NoteGPT is thinking...");
+        spinner = new Spinner(retryCount > 0 ? `Rotasi Akun (${retryCount}). NoteGPT berpikir...` : "NoteGPT is thinking...");
         spinner.start();
     }
-    
-    const targetConvId = convId || cliConversationId;
+
     const payload = {
         message: prompt,
         language: "auto",
@@ -197,26 +344,28 @@ async function askNoteGPT(prompt, modelStr, retryCount = 0, imageUrl = null, isA
         chat_mode: "standard"
     };
 
+    let reader = null;
+
     try {
-        const response = await fetch('https://notegpt.io/api/v2/chat/stream', {
+        const response = await fetchWithTimeout('https://notegpt.io/api/v2/chat/stream', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Cookie': `nc_token=${TOKEN}`,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Cookie': `nc_token=${activeToken}`,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
                 'Origin': 'https://notegpt.io',
                 'Referer': 'https://notegpt.io/ai-chat',
                 'Accept': '*/*'
             },
             body: JSON.stringify(payload)
-        });
+        }, 45000);
 
         if (!response.ok) {
-            if (!isAPI) spinner.stop();
-            return await handleLimitOrError(prompt, modelStr, retryCount, `HTTP ${response.status}`, imageUrl, isAPI);
+            if (!isAPI && spinner) spinner.stop();
+            return await handleLimitOrError(prompt, modelStr, retryCount, `HTTP ${response.status}`, imageUrl, isAPI, targetConvId);
         }
 
-        const reader = response.body.getReader();
+        reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let done = false;
         
@@ -224,6 +373,7 @@ async function askNoteGPT(prompt, modelStr, retryCount = 0, imageUrl = null, isA
         let isExpired = false;
         let spinnerStopped = false;
         let isReasoning = false; 
+        let sseBuffer = "";
         
         let fullText = "";
         let fullReasoning = "";
@@ -232,31 +382,36 @@ async function askNoteGPT(prompt, modelStr, retryCount = 0, imageUrl = null, isA
             const { value, done: readerDone } = await reader.read();
             done = readerDone;
             if (value) {
-                const chunk = decoder.decode(value, { stream: true });
-                if (chunk.includes('"code":') && chunk.includes('164002')) {
-                    isExpired = true;
-                    break;
-                }
-                
-                if (!isAPI && !spinnerStopped) {
-                    spinner.stop();
-                    spinnerStopped = true;
-                    if (retryCount === 0) process.stdout.write(`${c.bold}${c.magenta}◼ NoteGPT:${c.reset} \n\n`);
-                }
-                
-                const lines = chunk.split('\n');
-                for (let line of lines) {
-                    if (line.startsWith('data: ')) {
-                        const jsonStr = line.substring(6).trim();
+                sseBuffer += decoder.decode(value, { stream: true });
+                const lines = sseBuffer.split('\n');
+                sseBuffer = lines.pop(); // Simpan baris yang belum selesai untuk iterasi chunk berikutnya
+
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed || trimmed.startsWith(':')) continue;
+                    
+                    if (trimmed.startsWith('data:')) {
+                        const jsonStr = trimmed.replace(/^data:\s*/, '');
                         if (jsonStr === '[DONE]' || !jsonStr) continue;
+                        
                         try {
                             const dataObj = JSON.parse(jsonStr);
                             
+                            if (dataObj.code && (dataObj.code === 164002 || dataObj.code === 100001 || dataObj.code === 100020)) {
+                                isExpired = true;
+                                break;
+                            }
+
                             if (dataObj.reasoning) {
                                 fullReasoning += dataObj.reasoning;
                                 if (!isAPI && showReasoning) {
+                                    if (!spinnerStopped) {
+                                        if (spinner) spinner.stop();
+                                        spinnerStopped = true;
+                                        if (retryCount === 0) process.stdout.write(`${c.bold}${c.magenta}◼ NoteGPT:${c.reset} \n\n`);
+                                    }
                                     if (!isReasoning) {
-                                        process.stdout.write(`\n${c.dim}┌─ Thinking...${c.reset}\n`);
+                                        process.stdout.write(`\n${c.dim}┌─ DeepThink Reasoning...${c.reset}\n`);
                                         isReasoning = true;
                                     }
                                     process.stdout.write(`${c.dim}${dataObj.reasoning}${c.reset}`);
@@ -267,8 +422,13 @@ async function askNoteGPT(prompt, modelStr, retryCount = 0, imageUrl = null, isA
                             if (dataObj.text) {
                                 fullText += dataObj.text;
                                 if (!isAPI) {
+                                    if (!spinnerStopped) {
+                                        if (spinner) spinner.stop();
+                                        spinnerStopped = true;
+                                        if (retryCount === 0) process.stdout.write(`${c.bold}${c.magenta}◼ NoteGPT:${c.reset} \n\n`);
+                                    }
                                     if (isReasoning) {
-                                        process.stdout.write(`\n${c.dim}└─ Thought complete${c.reset}\n\n`);
+                                        process.stdout.write(`\n${c.dim}└─ Selesai Menalar${c.reset}\n\n`);
                                         isReasoning = false;
                                     }
                                     process.stdout.write(dataObj.text);
@@ -281,43 +441,79 @@ async function askNoteGPT(prompt, modelStr, retryCount = 0, imageUrl = null, isA
             }
         }
         
-        if (!isAPI && !spinnerStopped) spinner.stop();
+        // Flush sisa buffer jika ada
+        if (sseBuffer && sseBuffer.trim().startsWith('data:')) {
+            try {
+                const jsonStr = sseBuffer.trim().replace(/^data:\s*/, '');
+                if (jsonStr && jsonStr !== '[DONE]') {
+                    const dataObj = JSON.parse(jsonStr);
+                    if (dataObj.text) {
+                        fullText += dataObj.text;
+                        if (!isAPI) process.stdout.write(dataObj.text);
+                        hasOutput = true;
+                    }
+                }
+            } catch (e) {}
+        }
+        
+        if (!isAPI && isReasoning) {
+            process.stdout.write(`\n${c.dim}└─ Selesai Menalar${c.reset}\n\n`);
+        }
+        
+        if (!isAPI && !spinnerStopped && spinner) spinner.stop();
         
         if (isExpired) return await handleLimitOrError(prompt, modelStr, retryCount, "Token Kadaluarsa", imageUrl, isAPI, targetConvId);
-        if (!hasOutput) return await handleLimitOrError(prompt, modelStr, retryCount, "Limit Internal", imageUrl, isAPI, targetConvId);
+        if (!hasOutput) return await handleLimitOrError(prompt, modelStr, retryCount, "Limit Tercapai / Output Kosong", imageUrl, isAPI, targetConvId);
         
         if (!isAPI) console.log("\n"); 
         
         return { text: fullText, reasoning: fullReasoning, conversation_id: targetConvId };
         
     } catch (e) {
-        if (!isAPI) spinner.stop();
-        return await handleLimitOrError(prompt, modelStr, retryCount, "Koneksi Terputus", imageUrl, isAPI, targetConvId);
+        if (!isAPI && spinner) spinner.stop();
+        if (reader) {
+            try { await reader.cancel(); } catch (err) {}
+        }
+        return await handleLimitOrError(prompt, modelStr, retryCount, `Koneksi/Jaringan: ${e.message}`, imageUrl, isAPI, targetConvId);
     }
 }
 
+// --- RESILIENT TOKEN ROTATION & AUTO-RECOVERY ---
 async function handleLimitOrError(prompt, modelStr, retryCount, reason, imageUrl = null, isAPI = false, convId = null) {
-    if (retryCount < TOKENS.length - 1) {
-        currentTokenIndex = (currentTokenIndex + 1) % TOKENS.length;
+    if (retryCount >= 3) {
+        throw new Error(`Maksimal percobaan rotasi (${retryCount}x) tercapai. Alasan: ${reason}`);
+    }
+
+    // Jika token saat ini expired/invalid, hapus dari pool
+    if (TOKENS.length > 0) {
+        TOKENS.splice(currentTokenIndex, 1);
+        if (currentTokenIndex >= TOKENS.length) {
+            currentTokenIndex = 0;
+        }
+    }
+
+    // Jika masih ada token cadangan dalam pool, gunakan
+    if (TOKENS.length > 0) {
         return await askNoteGPT(prompt, modelStr, retryCount + 1, imageUrl, isAPI, convId);
-    } else {
-        let spinner;
-        if (!isAPI) {
-            spinner = new Spinner("Limit tercapai. Membuat akun cadangan baru...");
-            spinner.start();
-        }
-        
-        const newToken = await createNewNoteGPTAccount();
-        if (!isAPI) spinner.stop();
-        
+    }
+
+    // Jika tidak ada token valid, generate token baru via Pure HTTP
+    let spinner;
+    if (!isAPI) {
+        spinner = new Spinner(`Token limit/expired (${reason}). Membuat akun cadangan baru secara instan...`);
+        spinner.start();
+    }
+
+    try {
+        const newToken = await generateFreshNoteGPTToken();
+        if (!isAPI && spinner) spinner.stop();
         if (newToken) {
-            TOKENS.push(newToken);
-            currentTokenIndex = TOKENS.length - 1;
-            return await askNoteGPT(prompt, modelStr, 0, imageUrl, isAPI, convId);
-        } else {
-            if (!isAPI) console.error(`\n${c.red}❌ Gagal membuat akun baru.${c.reset}\n`);
-            throw new Error("Gagal membuat akun baru secara otomatis.");
+            return await askNoteGPT(prompt, modelStr, retryCount + 1, imageUrl, isAPI, convId);
         }
+    } catch (err) {
+        if (!isAPI && spinner) spinner.stop();
+        if (!isAPI) console.error(`\n${c.red}❌ Gagal membuat akun baru: ${err.message}${c.reset}\n`);
+        throw new Error(`Gagal membuat akun NoteGPT baru: ${err.message}`);
     }
 }
 
@@ -325,8 +521,8 @@ async function handleLimitOrError(prompt, modelStr, retryCount, reason, imageUrl
 app.post('/api/chat', async (req, res) => {
     try {
         const { message, model, image_url, conversation_id } = req.body;
-        if (!message) return res.status(400).json({ error: "Message is required" });
-        const targetModel = model || "gpt-4o";
+        if (!message) return res.status(400).json({ error: "Parameter 'message' wajib diisi." });
+        const targetModel = model || selectedModel || "gpt-4o";
         const convId = conversation_id || `api-conv-${Date.now()}`;
         const result = await askNoteGPT(message, targetModel, 0, image_url || null, true, convId);
         res.json(result);
@@ -335,28 +531,43 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-// Endpoint for direct image upload via multipart/form-data
+// Endpoint for multipart image upload & chat
 app.post('/api/chat/upload', upload.single('image'), async (req, res) => {
+    let tempFilePath = req.file ? req.file.path : null;
     try {
-        const { message, model } = req.body;
-        if (!message) return res.status(400).json({ error: "Message is required" });
+        const { message, model, conversation_id } = req.body;
+        if (!message) return res.status(400).json({ error: "Parameter 'message' wajib diisi." });
         
         let imageUrl = null;
-        if (req.file) {
-            imageUrl = await uploadToUguu(req.file.path);
-            fs.unlinkSync(req.file.path); // cleanup
+        if (tempFilePath) {
+            imageUrl = await uploadToUguu(tempFilePath);
         }
         
-        const targetModel = model || "gpt-4o";
-        const convId = req.body.conversation_id || `api-conv-${Date.now()}`;
+        const targetModel = model || selectedModel || "gpt-4o";
+        const convId = conversation_id || `api-conv-${Date.now()}`;
         const result = await askNoteGPT(message, targetModel, 0, imageUrl, true, convId);
         res.json(result);
     } catch (error) {
         res.status(500).json({ error: error.message });
+    } finally {
+        if (tempFilePath && fs.existsSync(tempFilePath)) {
+            try { fs.unlinkSync(tempFilePath); } catch (e) {}
+        }
     }
 });
 
-// --- CLI LOGIC ---
+// Endpoint for checking server status & tokens
+app.get('/api/status', (req, res) => {
+    res.json({
+        status: "online",
+        engine: "100% Pure HTTP (Zero Browser)",
+        activeTokensCount: TOKENS.length,
+        defaultModel: selectedModel,
+        availableModels: availableModels
+    });
+});
+
+// --- CLI INTERACTION LOGIC ---
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
@@ -364,24 +575,29 @@ const rl = readline.createInterface({
 
 function startChat() {
     console.log(c.clear);
-    console.log(`${c.bold}${c.cyan}NoteGPT CLI & API${c.reset} ${c.dim}v2.0${c.reset}`);
-    console.log(`${c.dim}─────────────────────────────────────────────────${c.reset}`);
+    console.log(`${c.bold}${c.cyan}NoteGPT CLI & API${c.reset} ${c.dim}v2.1 [100% Pure HTTP / Zero Browser]${c.reset}`);
+    console.log(`${c.dim}─────────────────────────────────────────────────────────────${c.reset}`);
     console.log(`${c.bold}Model     :${c.reset} ${c.green}${selectedModel}${c.reset}`);
     console.log(`${c.bold}DeepThink :${c.reset} ${showReasoning ? c.green + 'ON' : c.red + 'OFF'}${c.reset}`);
-    console.log(`${c.bold}Auto-Akun :${c.reset} ${c.green}Aktif (${TOKENS.length} Standby)${c.reset}`);
+    console.log(`${c.bold}Engine    :${c.reset} ${c.green}100% Pure HTTP Direct REST API (Ultra-Fast)${c.reset}`);
     console.log(`${c.bold}REST API  :${c.reset} ${c.green}http://localhost:${PORT}${c.reset}`);
-    console.log(`${c.dim}─────────────────────────────────────────────────${c.reset}`);
+    console.log(`${c.dim}─────────────────────────────────────────────────────────────${c.reset}`);
     console.log(`${c.bold}Command List:${c.reset}`);
-    console.log(`  ${c.cyan}/image <path> [prompt]${c.reset}  : Analisis gambar lokal (Bisa spasi)`);
+    console.log(`  ${c.cyan}/image <path> [prompt]${c.reset}  : Analisis gambar lokal`);
+    console.log(`  ${c.cyan}/models${c.reset}                 : Ganti model AI`);
     console.log(`  ${c.cyan}exit, /exit, /quit${c.reset}      : Keluar dari aplikasi`);
-    console.log(`${c.dim}─────────────────────────────────────────────────${c.reset}\n`);
+    console.log(`${c.dim}─────────────────────────────────────────────────────────────${c.reset}\n`);
     
     const promptLoop = () => {
         rl.question(`${c.bold}${c.green}You:${c.reset} `, async (input) => {
             const lowInput = input.trim().toLowerCase();
             if (lowInput === 'exit' || lowInput === '/exit' || lowInput === '/quit') {
-                console.log("Bye!");
+                console.log("Sampai jumpa!");
                 process.exit(0);
+            }
+            if (lowInput === '/models' || lowInput === '/model') {
+                selectModel();
+                return;
             }
             if (input.trim() === '') {
                 promptLoop();
@@ -427,10 +643,10 @@ function startChat() {
                     currentImageUrl = await uploadToUguu(filePath);
                     spinner.stop();
                     console.log(`${c.green}✅ Gambar terunggah! Memproses ke AI...${c.reset}\n`);
-                    finalInput = remainingPrompt.trim() === '' ? 'Apa isi gambar ini?' : remainingPrompt;
+                    finalInput = remainingPrompt.trim() === '' ? 'Tolong jelaskan isi gambar ini.' : remainingPrompt;
                 } catch (e) {
                     spinner.stop();
-                    console.log(`${c.red}❌ Error: ${e.message}${c.reset}\n`);
+                    console.log(`${c.red}❌ Error Upload: ${e.message}${c.reset}\n`);
                     promptLoop();
                     return;
                 }
@@ -450,8 +666,8 @@ function startChat() {
 
 function selectModel() {
     console.log(c.clear);
-    console.log(`${c.bold}${c.cyan}Welcome to NoteGPT CLI & API${c.reset}\n`);
-    console.log(`${c.bold}Select AI Model:${c.reset}`);
+    console.log(`${c.bold}${c.cyan}=== NoteGPT CLI & API ===${c.reset}\n`);
+    console.log(`${c.bold}Pilih Model AI:${c.reset}`);
     
     availableModels.forEach((model, index) => {
         let flags = [];
@@ -459,11 +675,11 @@ function selectModel() {
         if (reasoningModels.includes(model)) flags.push(`${c.cyan}[Reasoning]${c.reset}`);
         if (flags.length === 0) flags.push(`${c.dim}[Text]${c.reset}`);
         
-        console.log(`  ${c.cyan}${index + 1}.${c.reset} ${model.padEnd(28, ' ')} ${flags.join(' ')}`);
+        console.log(`  ${c.cyan}${index + 1}.${c.reset} ${model.padEnd(25, ' ')} ${flags.join(' ')}`);
     });
     console.log("");
     
-    rl.question(`${c.bold}${c.blue}?${c.reset} Choice (1-${availableModels.length}): `, (answer) => {
+    rl.question(`${c.bold}${c.blue}?${c.reset} Pilihan (1-${availableModels.length}): `, (answer) => {
         const num = parseInt(answer.trim());
         if (!isNaN(num) && num >= 1 && num <= availableModels.length) {
             selectedModel = availableModels[num - 1];
@@ -472,16 +688,32 @@ function selectModel() {
         }
         
         if (reasoningModels.includes(selectedModel)) {
-            rl.question(`${c.bold}${c.blue}?${c.reset} Enable DeepThink reasoning? (Y/n): `, (ans2) => {
+            rl.question(`${c.bold}${c.blue}?${c.reset} Aktifkan DeepThink reasoning? (Y/n): `, (ans2) => {
                 showReasoning = ans2.trim().toLowerCase() !== 'n';
-                app.listen(PORT, () => startChat());
+                if (!app.listening) {
+                    app.listen(PORT, () => startChat());
+                } else {
+                    startChat();
+                }
             });
         } else {
             showReasoning = false;
-            app.listen(PORT, () => startChat());
+            if (!app.listening) {
+                app.listen(PORT, () => startChat());
+            } else {
+                startChat();
+            }
         }
     });
 }
 
-// --- BOOT ---
-selectModel();
+// --- BOOT MODE (CLI or Standalone Headless Server) ---
+const isServerMode = process.argv.includes('--server') || !process.stdin.isTTY;
+
+if (isServerMode) {
+    app.listen(PORT, () => {
+        console.log(`[NoteGPT Server] Berjalan di port ${PORT} (100% Pure HTTP)`);
+    });
+} else {
+    selectModel();
+}
